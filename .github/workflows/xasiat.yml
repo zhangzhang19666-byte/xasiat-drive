@@ -1,0 +1,89 @@
+name: xasiat-drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "probe = 只对比 curl_cffi/aiohttp 连通性；run = 正式下载上传"
+        type: choice
+        options:
+          - probe
+          - run
+        default: probe
+      chain:
+        description: "串联轮次（0/1/2），一般留空"
+        type: string
+        default: "0"
+      clear_halt:
+        description: "清除 Drive 上的 HALT/DONE 标记后运行"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 7 * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: xasiat-pipeline
+  cancel-in-progress: false
+
+jobs:
+  xasiat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: install rclone
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'run')
+        run: |
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o rclone.zip
+          unzip -q rclone.zip
+          cp rclone-*/rclone /usr/local/bin/rclone
+          rclone version
+
+      - name: probe
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'probe'
+        env:
+          MODE: probe
+          HTTP_BACKEND: curl_cffi
+          IMPERSONATE: chrome
+        run: python run.py
+
+      - name: run
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'run')
+        env:
+          MODE: run
+          CHAIN: ${{ github.event_name == 'workflow_dispatch' && inputs.chain || '0' }}
+          CLEAR_HALT: ${{ github.event_name == 'workflow_dispatch' && inputs.clear_halt && '1' || '0' }}
+          HTTP_BACKEND: ${{ vars.XASIAT_HTTP_BACKEND || 'curl_cffi' }}
+          IMPERSONATE: chrome
+          XASIAT_START_ID: "10999"
+          XASIAT_DEST: ""
+          DOWNLOAD_MIN: "300"
+          WINDOW_MIN: "50"
+          MAX_CHAIN: "3"
+          CONCURRENCY: "30"
+          WORKFLOW_FILE: xasiat.yml
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RCLONE_CONFIG_DRIVE_TYPE: drive
+          RCLONE_CONFIG_DRIVE_SCOPE: drive
+          RCLONE_CONFIG_DRIVE_CLIENT_ID: ${{ secrets.DRIVE_CLIENT_ID }}
+          RCLONE_CONFIG_DRIVE_CLIENT_SECRET: ${{ secrets.DRIVE_CLIENT_SECRET }}
+          RCLONE_CONFIG_DRIVE_ROOT_FOLDER_ID: 1cqcPRzhtUXUfkEDfQ1NDj6UbNwzgZnZQ
+          RCLONE_CONFIG_DRIVE_TOKEN: '{"access_token":"","token_type":"Bearer","refresh_token":"${{ secrets.DRIVE_REFRESH_TOKEN }}","expiry":"2020-01-01T00:00:00Z"}'
+        run: |
+          rclone about drive: || true
+          rclone lsd drive: || true
+          python run.py
