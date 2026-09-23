@@ -8,6 +8,7 @@ on:
         type: choice
         options:
           - probe
+          - bench
           - run
         default: probe
       chain:
@@ -59,6 +60,16 @@ jobs:
           MODE: probe
           HTTP_BACKEND: curl_cffi
           IMPERSONATE: chrome
+        run: python run.py
+
+      - name: bench
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'bench'
+        env:
+          MODE: bench
+          HTTP_BACKEND: curl_cffi
+          IMPERSONATE: chrome
+          CONCURRENCY: "30"
+          BENCH_IMAGES: "120"
         run: python run.py
 
       - name: run
