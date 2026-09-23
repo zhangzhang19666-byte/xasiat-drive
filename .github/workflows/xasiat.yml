@@ -86,7 +86,9 @@ jobs:
           WINDOW_MIN: "50"
           MAX_CHAIN: "3"
           BUFFER: "3"
-          CONCURRENCY: "30"
+          UPLOAD_BATCH: "6"
+          UPLOAD_TRANSFERS: "6"
+          CONCURRENCY: "60"
           WORKFLOW_FILE: xasiat.yml
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RCLONE_CONFIG_DRIVE_TYPE: drive

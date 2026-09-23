@@ -41,6 +41,8 @@ DOWNLOAD_MIN = float(os.environ.get("DOWNLOAD_MIN", "300"))
 WINDOW_MIN = float(os.environ.get("WINDOW_MIN", "50"))
 MAX_CHAIN = int(os.environ.get("MAX_CHAIN", "3"))
 BUFFER = int(os.environ.get("BUFFER", "3"))
+UPLOAD_BATCH = int(os.environ.get("UPLOAD_BATCH", "6"))
+UPLOAD_TRANSFERS = int(os.environ.get("UPLOAD_TRANSFERS", "6"))
 CHAIN = int(os.environ.get("CHAIN", "0"))
 MODE = os.environ.get("MODE", "run").strip().lower()
 BACKEND = os.environ.get("HTTP_BACKEND", "curl_cffi").strip().lower()
@@ -259,8 +261,9 @@ async def download_album_images(session, album_id, folder, images, backend):
     return results.count("success"), results.count("skip"), results.count("failed")
 
 
-def make_zip(folder, save_dir):
-    zip_path = WORK / (folder + ".zip")
+def make_zip(folder, save_dir, out_dir):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = out_dir / (folder + ".zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as z:
         for p in sorted(save_dir.rglob("*")):
             if p.is_file():
@@ -309,18 +312,27 @@ def halt(reason):
 _UPCOUNT = {"n": 0}
 
 
-def upload_zip(zip_path):
-    size = zip_path.stat().st_size
+def upload_dir(out_dir):
+    zips = sorted(out_dir.glob("*.zip"))
+    if not zips:
+        return True
+    total = sum(p.stat().st_size for p in zips)
     _UPCOUNT["n"] += 1
-    if _UPCOUNT["n"] % 10 == 1:
+    if _UPCOUNT["n"] % 5 == 1:
         free = drive_free_bytes()
-        if free is not None and free < size + 100 * 1024 * 1024:
-            halt(f"Drive 剩余 {free} < 需要 {size}")
+        if free is not None and free < total + 200 * 1024 * 1024:
+            halt(f"Drive 剩余 {free} < 需要 {total}")
             return False
-    rc, out, err = rclone(["copy", str(zip_path), DEST_URI, "--stats-one-line"])
+    rc, out, err = rclone([
+        "copy", str(out_dir), DEST_URI,
+        "--transfers", str(UPLOAD_TRANSFERS),
+        "--checkers", str(UPLOAD_TRANSFERS),
+        "--drive-chunk-size", "64M",
+        "--stats-one-line",
+    ])
     if rc != 0:
         text = (err + out).lower()
-        print(f"上传失败：{err.strip()[:300]}", flush=True)
+        print(f"批量上传失败：{err.strip()[:300]}", flush=True)
         if "quota" in text or "storagequota" in text or "insufficient" in text:
             halt("Drive 容量不足/配额超限，无法上传")
         return False
@@ -494,48 +506,58 @@ async def run():
             finally:
                 await q.put(None)
 
+        OUT = WORK / "out"
+        OUT.mkdir(parents=True, exist_ok=True)
+        batch = []
+
+        async def flush():
+            if not batch:
+                return True
+            if any(x[0] == "ok" for x in batch):
+                if not await asyncio.to_thread(upload_dir, OUT):
+                    state["halt"] = True
+                    batch.clear()
+                    return False
+                for f in OUT.glob("*.zip"):
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+            for kind, aid, folder, scan in batch:
+                if kind in ("ok", "empty"):
+                    append_downloaded(aid, folder)
+            scans = [aid for _k, aid, _f, scan in batch if scan]
+            if scans:
+                set_cursor(max(scans) + 1)
+            push_state()
+            batch.clear()
+            return True
+
         async def consumer():
             while True:
                 item = await q.get()
                 if item is None:
+                    await flush()
                     break
                 kind, aid, folder, scan = item
                 if state["halt"]:
                     if folder:
                         shutil.rmtree(WORK / folder, ignore_errors=True)
-                    continue
-                if kind == "ok":
-                    zip_path = make_zip(folder, WORK / folder)
-                    good = await asyncio.to_thread(upload_zip, zip_path)
-                    if not good:
-                        state["halt"] = True
                         try:
-                            zip_path.unlink()
+                            (OUT / (folder + ".zip")).unlink()
                         except Exception:
                             pass
-                        shutil.rmtree(WORK / folder, ignore_errors=True)
-                        continue
+                    continue
+                if kind == "ok":
+                    make_zip(folder, WORK / folder, OUT)
                     shutil.rmtree(WORK / folder, ignore_errors=True)
-                    try:
-                        zip_path.unlink()
-                    except Exception:
-                        pass
-                    append_downloaded(aid, folder)
-                    if scan:
-                        set_cursor(aid + 1)
-                    push_state()
+                    batch.append((kind, aid, folder, scan))
                     print(f"[{aid}] ✓ {folder}", flush=True)
-                elif kind == "empty":
-                    append_downloaded(aid, folder)
-                    if scan:
-                        set_cursor(aid + 1)
-                    push_state()
-                    print(f"[{aid}] 空相册 {folder}", flush=True)
                 else:
-                    if scan:
-                        set_cursor(aid + 1)
-                    push_state()
+                    batch.append((kind, aid, folder, scan))
                     print(f"[{aid}] {kind}", flush=True)
+                if len(batch) >= UPLOAD_BATCH:
+                    await flush()
 
         prod = asyncio.create_task(producer())
         cons = asyncio.create_task(consumer())
