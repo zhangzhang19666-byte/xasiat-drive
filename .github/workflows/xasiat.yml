@@ -85,6 +85,7 @@ jobs:
           DOWNLOAD_MIN: "300"
           WINDOW_MIN: "50"
           MAX_CHAIN: "3"
+          BUFFER: "3"
           CONCURRENCY: "30"
           WORKFLOW_FILE: xasiat.yml
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

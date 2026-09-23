@@ -40,6 +40,7 @@ MAX_RETRY_ROUNDS = int(os.environ.get("MAX_RETRY_ROUNDS", "3"))
 DOWNLOAD_MIN = float(os.environ.get("DOWNLOAD_MIN", "300"))
 WINDOW_MIN = float(os.environ.get("WINDOW_MIN", "50"))
 MAX_CHAIN = int(os.environ.get("MAX_CHAIN", "3"))
+BUFFER = int(os.environ.get("BUFFER", "3"))
 CHAIN = int(os.environ.get("CHAIN", "0"))
 MODE = os.environ.get("MODE", "run").strip().lower()
 BACKEND = os.environ.get("HTTP_BACKEND", "curl_cffi").strip().lower()
@@ -183,9 +184,10 @@ async def fetch_page(session, album_id, backend):
                 return {"status": "empty", "folder": folder, "images": []}
             return {"status": "ok", "folder": folder, "images": images}
         except Exception as e:
-            print(f"[{album_id}] 获取页面失败 ({attempt}/{RETRIES})：{e}", flush=True)
             if attempt < RETRIES:
                 await asyncio.sleep(1.5 * attempt)
+            else:
+                print(f"[{album_id}] 页面失败：{e}", flush=True)
     return {"status": "error", "folder": None, "images": []}
 
 
@@ -228,7 +230,6 @@ async def download_image(session, sem, album_id, image_url, filepath, index, tot
                     raise RuntimeError("下载文件为空")
                 temp_file.write_bytes(data)
                 os.replace(temp_file, filepath)
-                print(f"    [{index}/{total}] ✓ {filepath.name}", flush=True)
                 return "success"
             except Exception as e:
                 if temp_file.exists():
@@ -239,7 +240,7 @@ async def download_image(session, sem, album_id, image_url, filepath, index, tot
                 if attempt < RETRIES:
                     await asyncio.sleep(1.5 * attempt)
                 else:
-                    print(f"    [{index}/{total}] ✗ {filepath.name} 失败：{e}", flush=True)
+                    print(f"[{album_id}] ✗ {filepath.name}", flush=True)
     return "failed"
 
 
@@ -305,12 +306,17 @@ def halt(reason):
     print(f"[HALT] {reason}", flush=True)
 
 
+_UPCOUNT = {"n": 0}
+
+
 def upload_zip(zip_path):
     size = zip_path.stat().st_size
-    free = drive_free_bytes()
-    if free is not None and free < size + 100 * 1024 * 1024:
-        halt(f"Drive 剩余 {free} < 需要 {size}")
-        return False
+    _UPCOUNT["n"] += 1
+    if _UPCOUNT["n"] % 10 == 1:
+        free = drive_free_bytes()
+        if free is not None and free < size + 100 * 1024 * 1024:
+            halt(f"Drive 剩余 {free} < 需要 {size}")
+            return False
     rc, out, err = rclone(["copy", str(zip_path), DEST_URI, "--stats-one-line"])
     if rc != 0:
         text = (err + out).lower()
@@ -361,67 +367,48 @@ def record_failed(album_id, reason):
         f.write(f"{album_id}|{reason}\n")
 
 
-async def process_album(session, album_id, backend, retry):
-    result = await fetch_page(session, album_id, backend)
+async def produce_one(session, album_id, scan, q, retry, state):
+    result = await fetch_page(session, album_id, BACKEND)
     status = result["status"]
 
     if status in ("404", "no_h1"):
-        print(f"[{album_id}] 跳过（{status}）", flush=True)
         retry.pop(album_id, None)
-        return True
+        await q.put(("skip", album_id, None, scan))
+        return
 
     if status == "empty":
-        print(f"[{album_id}] 空相册：{result['folder']}", flush=True)
-        append_downloaded(album_id, result["folder"])
         retry.pop(album_id, None)
-        return True
+        await q.put(("empty", album_id, result["folder"], scan))
+        return
 
     if status == "error":
         cnt = retry.get(album_id, 0) + 1
         if cnt >= MAX_RETRY_ROUNDS:
             record_failed(album_id, "page_error")
             retry.pop(album_id, None)
-            print(f"[{album_id}] 页面反复失败，记入 failed", flush=True)
-            return True
-        retry[album_id] = cnt
-        print(f"[{album_id}] 页面失败，留待重试（第 {cnt} 次）", flush=True)
-        return False
+        else:
+            retry[album_id] = cnt
+        save_retry(retry)
+        await q.put(("pageerr", album_id, None, scan))
+        return
 
     folder = result["folder"]
     images = result["images"]
-    print(f"[{album_id}] 文件夹：{folder}  图片数：{len(images)}", flush=True)
-    ok, skip, fail = await download_album_images(session, album_id, folder, images, backend)
-    save_dir = WORK / folder
-
+    ok, skip, fail = await download_album_images(session, album_id, folder, images, BACKEND)
     if fail == 0:
-        zip_path = make_zip(folder, save_dir)
-        if not upload_zip(zip_path):
-            try:
-                zip_path.unlink()
-            except Exception:
-                pass
-            print(f"[{album_id}] 上传失败，保留待重试", flush=True)
-            return False
-        shutil.rmtree(save_dir, ignore_errors=True)
-        try:
-            zip_path.unlink()
-        except Exception:
-            pass
-        append_downloaded(album_id, folder)
         retry.pop(album_id, None)
-        print(f"[{album_id}] ✓ 完成 成功{ok} 跳过{skip} 失败{fail} 已上传", flush=True)
-        return True
-
+        save_retry(retry)
+        await q.put(("ok", album_id, folder, scan))
+        return
+    shutil.rmtree(WORK / folder, ignore_errors=True)
     cnt = retry.get(album_id, 0) + 1
     if cnt >= MAX_RETRY_ROUNDS:
-        shutil.rmtree(save_dir, ignore_errors=True)
         record_failed(album_id, "img_fail")
         retry.pop(album_id, None)
-        print(f"[{album_id}] 图片反复失败（失败{fail}），记入 failed", flush=True)
-        return True
-    retry[album_id] = cnt
-    print(f"[{album_id}] 存在失败图片{fail}，不上传，留待重试（第 {cnt} 次）", flush=True)
-    return False
+    else:
+        retry[album_id] = cnt
+    save_retry(retry)
+    await q.put(("imgerr", album_id, folder, scan))
 
 
 def trigger_next(next_chain):
@@ -468,6 +455,7 @@ async def run():
 
     retry = load_retry()
     cursor = load_cursor() or START_ID
+    state = {"halt": False}
     finished = False
 
     async with make_session(BACKEND) as session:
@@ -475,7 +463,10 @@ async def run():
         if live_max is None:
             print("无法获取实时最大 ID —— 安全退出", flush=True)
             return
-        print(f"实时最大 ID={live_max} 游标={cursor} 后端={BACKEND} 链={CHAIN}", flush=True)
+        print(
+            f"实时最大 ID={live_max} 游标={cursor} 后端={BACKEND} 链={CHAIN} 缓冲={BUFFER}",
+            flush=True,
+        )
 
         if cursor > live_max and not retry:
             DONE_FILE.write_text("done", encoding="utf-8")
@@ -484,27 +475,74 @@ async def run():
             return
 
         deadline = time.monotonic() + DOWNLOAD_MIN * 60
+        q = asyncio.Queue(maxsize=BUFFER)
+        pos = {"next": cursor}
 
-        for rid in sorted(list(retry.keys())):
-            if HALT_FILE.exists() or time.monotonic() >= deadline:
-                break
-            await process_album(session, rid, BACKEND, retry)
-            save_retry(retry)
-            push_state()
+        async def producer():
+            try:
+                for rid in sorted(list(retry.keys())):
+                    if state["halt"] or time.monotonic() >= deadline:
+                        break
+                    await produce_one(session, rid, False, q, retry, state)
+                while (
+                    pos["next"] <= live_max
+                    and not state["halt"]
+                    and time.monotonic() < deadline
+                ):
+                    await produce_one(session, pos["next"], True, q, retry, state)
+                    pos["next"] += 1
+            finally:
+                await q.put(None)
 
-        while cursor <= live_max:
-            if HALT_FILE.exists():
-                break
-            if time.monotonic() >= deadline:
-                print("到达下载时间预算 —— 收尾", flush=True)
-                break
-            await process_album(session, cursor, BACKEND, retry)
-            cursor += 1
-            set_cursor(cursor)
-            save_retry(retry)
-            push_state()
+        async def consumer():
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                kind, aid, folder, scan = item
+                if state["halt"]:
+                    if folder:
+                        shutil.rmtree(WORK / folder, ignore_errors=True)
+                    continue
+                if kind == "ok":
+                    zip_path = make_zip(folder, WORK / folder)
+                    good = await asyncio.to_thread(upload_zip, zip_path)
+                    if not good:
+                        state["halt"] = True
+                        try:
+                            zip_path.unlink()
+                        except Exception:
+                            pass
+                        shutil.rmtree(WORK / folder, ignore_errors=True)
+                        continue
+                    shutil.rmtree(WORK / folder, ignore_errors=True)
+                    try:
+                        zip_path.unlink()
+                    except Exception:
+                        pass
+                    append_downloaded(aid, folder)
+                    if scan:
+                        set_cursor(aid + 1)
+                    push_state()
+                    print(f"[{aid}] ✓ {folder}", flush=True)
+                elif kind == "empty":
+                    append_downloaded(aid, folder)
+                    if scan:
+                        set_cursor(aid + 1)
+                    push_state()
+                    print(f"[{aid}] 空相册 {folder}", flush=True)
+                else:
+                    if scan:
+                        set_cursor(aid + 1)
+                    push_state()
+                    print(f"[{aid}] {kind}", flush=True)
 
-        finished = cursor > live_max and not retry
+        prod = asyncio.create_task(producer())
+        cons = asyncio.create_task(consumer())
+        await prod
+        await cons
+
+        finished = pos["next"] > live_max and not retry and not state["halt"]
 
     if HALT_FILE.exists():
         print("处于 HALT —— 不串联", flush=True)
