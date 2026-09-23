@@ -27,7 +27,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: xasiat-pipeline
+  group: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'probe' || github.event.inputs.mode == 'bench')) && 'xasiat-test' || 'xasiat-run' }}
   cancel-in-progress: false
 
 jobs:
@@ -66,10 +66,10 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'bench'
         env:
           MODE: bench
-          HTTP_BACKEND: curl_cffi
+          HTTP_BACKEND: aiohttp
           IMPERSONATE: chrome
-          CONCURRENCY: "30"
-          BENCH_IMAGES: "120"
+          BENCH_IMAGES: "240"
+          BENCH_CONCURRENCIES: "30,60,100"
         run: python run.py
 
       - name: run

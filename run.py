@@ -615,29 +615,32 @@ async def probe():
 
 async def bench():
     import statistics
+    import aiohttp
 
-    target = int(os.environ.get("BENCH_IMAGES", "120"))
+    target = int(os.environ.get("BENCH_IMAGES", "240"))
+    concs = [int(x) for x in os.environ.get("BENCH_CONCURRENCIES", "30,60,100").split(",")]
+    backend = "aiohttp"
     urls = []
-    async with make_session(BACKEND) as session:
-        live = await get_live_max(session, BACKEND)
+    async with make_session(backend) as session:
+        live = await get_live_max(session, backend)
         print(f"BENCH live_max={live}", flush=True)
         aid = live
-        while aid > 0 and len(urls) < target and aid > live - 80:
-            r = await fetch_page(session, aid, BACKEND)
+        while aid > 0 and len(urls) < target and aid > live - 400:
+            r = await fetch_page(session, aid, backend)
             if r["status"] == "ok":
                 urls.extend(x["url"] for x in r["images"])
             aid -= 1
     urls = urls[:target]
-    print(f"BENCH images={len(urls)} concurrent={CONCURRENCY}", flush=True)
+    print(f"BENCH images={len(urls)} concs={concs}", flush=True)
     if not urls:
         print("BENCH no urls", flush=True)
         return
 
-    for backend in ("aiohttp", "curl_cffi"):
-        d = WORK / f"bench_{backend}"
+    for conc in concs:
+        d = WORK / f"bench_{conc}"
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True, exist_ok=True)
-        sem = asyncio.Semaphore(CONCURRENCY)
+        sem = asyncio.Semaphore(conc)
         lat = []
 
         async def one(i, u):
@@ -645,11 +648,7 @@ async def bench():
                 t = time.monotonic()
                 try:
                     st, data = await http_get(
-                        session,
-                        u,
-                        _headers(backend, {"Accept": IMG_ACCEPT}),
-                        IMG_TIMEOUT,
-                        backend,
+                        session, u, _headers(backend, {"Accept": IMG_ACCEPT}), IMG_TIMEOUT, backend
                     )
                     lat.append(time.monotonic() - t)
                     if st == 200 and data:
@@ -659,8 +658,9 @@ async def bench():
                     pass
                 return -1
 
+        conn = aiohttp.TCPConnector(limit=conc, limit_per_host=conc, ssl=False)
         t0 = time.monotonic()
-        async with make_session(backend) as session:
+        async with aiohttp.ClientSession(connector=conn, headers=_headers(backend)) as session:
             res = await asyncio.gather(*[one(i, u) for i, u in enumerate(urls)])
         dt = time.monotonic() - t0
         ok = [x for x in res if x and x > 0]
@@ -668,8 +668,8 @@ async def bench():
         speed = mb / dt if dt else 0
         avglat = (statistics.mean(lat) * 1000) if lat else 0
         print(
-            f"[BENCH {backend}] ok={len(ok)}/{len(urls)} bytes={sum(ok)} "
-            f"time={dt:.2f}s speed={speed:.2f}MB/s avg_lat={avglat:.0f}ms",
+            f"[BENCH conc={conc}] ok={len(ok)}/{len(urls)} time={dt:.2f}s "
+            f"speed={speed:.2f}MB/s avg_lat={avglat:.0f}ms",
             flush=True,
         )
         shutil.rmtree(d, ignore_errors=True)
