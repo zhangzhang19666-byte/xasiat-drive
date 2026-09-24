@@ -4,6 +4,7 @@ import json
 import time
 import shutil
 import zipfile
+import hashlib
 import asyncio
 import subprocess
 from pathlib import Path
@@ -102,7 +103,11 @@ async def http_get(session, url, headers, sec, backend):
 def safe_filename(name):
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
     name = name.strip().rstrip(" .")
-    return name
+    b = name.encode("utf-8")
+    if len(b) > 150:
+        h = hashlib.sha1(b).hexdigest()[:8]
+        name = b[:140].decode("utf-8", "ignore").rstrip(" .") + "_" + h
+    return name or "album"
 
 
 def get_filename_from_original(data_original):
@@ -114,6 +119,9 @@ def get_filename_from_original(data_original):
         return None
     if not re.search(r"\.(jpg|jpeg|png|webp|gif)$", filename, re.IGNORECASE):
         return None
+    if len(filename.encode("utf-8")) > 150:
+        root, ext = os.path.splitext(filename)
+        filename = root.encode("utf-8")[:130].decode("utf-8", "ignore") + ext
     return filename
 
 
