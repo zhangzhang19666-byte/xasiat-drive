@@ -242,7 +242,7 @@ async def download_image(session, sem, album_id, image_url, filepath, index, tot
                 if attempt < RETRIES:
                     await asyncio.sleep(1.5 * attempt)
                 else:
-                    print(f"[{album_id}] ✗ {filepath.name}", flush=True)
+                    print(f"[{album_id}] ✗ {filepath.name} {type(e).__name__}: {str(e)[:80]}", flush=True)
     return "failed"
 
 
@@ -271,10 +271,12 @@ def make_zip(folder, save_dir, out_dir):
     return zip_path
 
 
-def rclone(args):
+def rclone(args, timeout=1200):
     try:
-        p = subprocess.run(["rclone", *args], capture_output=True, text=True)
+        p = subprocess.run(["rclone", *args], capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout or ""), (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "", "rclone timeout killed"
     except FileNotFoundError:
         return 127, "", "rclone not found"
     except Exception as e:
@@ -315,28 +317,36 @@ _UPCOUNT = {"n": 0}
 def upload_dir(out_dir):
     zips = sorted(out_dir.glob("*.zip"))
     if not zips:
-        return True
+        return "ok"
     total = sum(p.stat().st_size for p in zips)
     _UPCOUNT["n"] += 1
     if _UPCOUNT["n"] % 5 == 1:
         free = drive_free_bytes()
         if free is not None and free < total + 200 * 1024 * 1024:
             halt(f"Drive 剩余 {free} < 需要 {total}")
-            return False
+            return "quota"
     rc, out, err = rclone([
         "copy", str(out_dir), DEST_URI,
         "--transfers", str(UPLOAD_TRANSFERS),
         "--checkers", str(UPLOAD_TRANSFERS),
         "--drive-chunk-size", "64M",
+        "--timeout", "5m",
+        "--contimeout", "30s",
+        "--retries", "3",
+        "--low-level-retries", "10",
+        "--drive-stop-on-upload-limit",
+        "--stats", "30s",
         "--stats-one-line",
-    ])
-    if rc != 0:
-        text = (err + out).lower()
-        print(f"批量上传失败：{err.strip()[:300]}", flush=True)
-        if "quota" in text or "storagequota" in text or "insufficient" in text:
-            halt("Drive 容量不足/配额超限，无法上传")
-        return False
-    return True
+    ], timeout=1800)
+    if rc == 0:
+        return "ok"
+    text = (err + out).lower()
+    print(f"批量上传失败 rc={rc}：{err.strip()[:400]}", flush=True)
+    if "upload limit" in text or "uploadlimit" in text or "user rate limit" in text:
+        return "limit"
+    if "quota" in text or "storagequota" in text or "insufficient" in text:
+        return "quota"
+    return "error"
 
 
 def append_downloaded(album_id, folder):
@@ -487,18 +497,22 @@ async def run():
             return
 
         deadline = time.monotonic() + DOWNLOAD_MIN * 60
+        t_start = time.monotonic()
         q = asyncio.Queue(maxsize=BUFFER)
         pos = {"next": cursor}
+
+        def stopped():
+            return state.get("halt") or state.get("stop")
 
         async def producer():
             try:
                 for rid in sorted(list(retry.keys())):
-                    if state["halt"] or time.monotonic() >= deadline:
+                    if stopped() or time.monotonic() >= deadline:
                         break
                     await produce_one(session, rid, False, q, retry, state)
                 while (
                     pos["next"] <= live_max
-                    and not state["halt"]
+                    and not stopped()
                     and time.monotonic() < deadline
                 ):
                     await produce_one(session, pos["next"], True, q, retry, state)
@@ -512,12 +526,22 @@ async def run():
 
         async def flush():
             if not batch:
-                return True
+                return
             if any(x[0] == "ok" for x in batch):
-                if not await asyncio.to_thread(upload_dir, OUT):
-                    state["halt"] = True
+                status = await asyncio.to_thread(upload_dir, OUT)
+                tries = 0
+                while status == "error" and tries < 3:
+                    tries += 1
+                    print(f"上传出错，重试 {tries}/3", flush=True)
+                    await asyncio.sleep(15 * tries)
+                    status = await asyncio.to_thread(upload_dir, OUT)
+                if status != "ok":
+                    state["stop"] = status
+                    if status == "quota":
+                        halt("Drive 容量不足/配额超限，无法上传")
+                    print(f"停止：上传状态={status}", flush=True)
                     batch.clear()
-                    return False
+                    return
                 for f in OUT.glob("*.zip"):
                     try:
                         f.unlink()
@@ -531,7 +555,6 @@ async def run():
                 set_cursor(max(scans) + 1)
             push_state()
             batch.clear()
-            return True
 
         async def consumer():
             while True:
@@ -540,7 +563,7 @@ async def run():
                     await flush()
                     break
                 kind, aid, folder, scan = item
-                if state["halt"]:
+                if stopped():
                     if folder:
                         shutil.rmtree(WORK / folder, ignore_errors=True)
                         try:
@@ -559,13 +582,45 @@ async def run():
                 if len(batch) >= UPLOAD_BATCH:
                     await flush()
 
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(60)
+                print(
+                    f"[心跳] 已跑 {int((time.monotonic()-t_start)/60)} 分 "
+                    f"队列={q.qsize()} 批={len(batch)} 后端={BACKEND}",
+                    flush=True,
+                )
+
+        hb = asyncio.create_task(heartbeat())
         prod = asyncio.create_task(producer())
         cons = asyncio.create_task(consumer())
-        await prod
-        await cons
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(prod, cons),
+                timeout=(DOWNLOAD_MIN + WINDOW_MIN) * 60,
+            )
+        except asyncio.TimeoutError:
+            print("达到硬预算 —— 取消任务并保存状态", flush=True)
+            prod.cancel()
+            cons.cancel()
+            await asyncio.gather(prod, cons, return_exceptions=True)
+        finally:
+            hb.cancel()
+            try:
+                await hb
+            except Exception:
+                pass
 
-        finished = pos["next"] > live_max and not retry and not state["halt"]
+        finished = (
+            pos["next"] > live_max
+            and not retry
+            and not state.get("halt")
+            and not state.get("stop")
+        )
 
+    if state.get("stop") == "limit":
+        print("命中 Drive 日上传上限(约750GB) —— 今日停跑，等明日 cron", flush=True)
+        return
     if HALT_FILE.exists():
         print("处于 HALT —— 不串联", flush=True)
         return

@@ -82,8 +82,8 @@ jobs:
           IMPERSONATE: chrome
           XASIAT_START_ID: "10999"
           XASIAT_DEST: ""
-          DOWNLOAD_MIN: "300"
-          WINDOW_MIN: "50"
+          DOWNLOAD_MIN: "280"
+          WINDOW_MIN: "25"
           MAX_CHAIN: "3"
           BUFFER: "3"
           UPLOAD_BATCH: "6"
@@ -98,6 +98,6 @@ jobs:
           RCLONE_CONFIG_DRIVE_ROOT_FOLDER_ID: 1cqcPRzhtUXUfkEDfQ1NDj6UbNwzgZnZQ
           RCLONE_CONFIG_DRIVE_TOKEN: '{"access_token":"","token_type":"Bearer","refresh_token":"${{ secrets.DRIVE_REFRESH_TOKEN }}","expiry":"2020-01-01T00:00:00Z"}'
         run: |
-          rclone about drive: || true
-          rclone lsd drive: || true
+          rclone about drive:
+          rclone lsd drive: --max-depth 1 || true
           python run.py
